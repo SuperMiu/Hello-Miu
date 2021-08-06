@@ -1,0 +1,121 @@
+import yfinance as yf
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+import requests
+
+#輸入想爬取的股票list，短期MA及長期MA天數，以及想爬取的資料時間(預設為6個月)
+def crawl_price(stock, sma, lma, slot='6mo'):
+    # stockid
+    # slot: 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max
+    
+    # crawl price data
+    stockdf = pd.DataFrame(data = yf.Ticker(stock).history(period = slot))
+    stockdf.reset_index(inplace=True)
+    
+    stockdf['Date'] = pd.to_datetime(stockdf['Date'], format = '%Y-%m-%d')
+    stockdf.set_index(['Date'], inplace = True)
+                    
+    # 計算SMA及LMA
+    SMA = 'MA{}'.format(sma)
+    LMA = 'MA{}'.format(lma)
+    
+    stockdf[SMA] = stockdf.Close.rolling(window = sma).mean()
+    stockdf[LMA] = stockdf.Close.rolling(window = lma).mean()
+    
+    stockdf.dropna() # clear the data without MA
+    
+    # 'Signal':當sma大於lma, Signal = 1，否則為0
+    stockdf['Signal'] = np.where(stockdf[SMA] >= stockdf[LMA], 1, 0)
+    
+    # 'Point': 判斷Signal變化，當signal[n] 與 signal[n-1](前一交易日)不同:
+    # 1(sma超過lma，買點), -1(sma跌破lma，賣點) , 0(沒變化)
+    stockdf['Point'] = stockdf['Signal'].diff() 
+             
+    return stockdf
+
+
+def graph(df, name, sma, lma):
+    SMA = 'MA{}'.format(sma)
+    LMA = 'MA{}'.format(lma)
+    
+    plt.figure(figsize = (20,10))
+       
+    # plot close price, short-term and long-term moving averages 
+    df['Close'].plot(color = 'gray', label= 'Close Price') 
+    df[SMA].plot(color = 'red', label = SMA) 
+    df[LMA].plot(color = 'orange', label = LMA)
+    # plot ‘buy’ signals and show the date
+    plt.plot(df[df['Point'] == 1].index, 
+             df[SMA][df['Point'] == 1], 
+             '^', markersize = 15, color = 'green', label = 'buy')
+    for i,j in zip(df[df['Point'] == 1].index, df[SMA][df['Point'] == 1]):
+        plt.text(i, j, str(i).replace(' 00:00:00',''))
+        
+    # plot ‘sell’ signals and show the date
+    plt.plot(df[df['Point'] == -1].index, 
+             df[SMA][df['Point'] == -1], 
+             'v', markersize = 15, color = 'red', label = 'sell')
+    for i,j in zip(df[df['Point'] == -1].index, df[SMA][df['Point'] == -1]):
+        plt.text(i, j, str(i).replace(' 00:00:00',''))       
+    
+    plt.ylabel('Price', fontsize = 15 )
+    plt.xlabel('Date', fontsize = 15 )
+    plt.title('{} Trend'.format(name), fontsize = 20)
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+# 判斷設定天數內(delta)的最新資料有無出現買點或賣點(預設為前一天收盤價)，
+# 輸入股價資料的dictionary
+def point(stock_dic, delta = 1):
+    buy_point = []
+    sell_point = []
+    for stock, stockdf in stock_dic.items():
+        for point in stockdf.iloc[-delta: , 10]: #找尋-delta列，第10欄('Point')資料
+            if point == 1:
+                buy_point.append(stock)
+            elif point == -1:
+                sell_point.append(stock)
+            else:
+                pass
+    
+    print('buying point:')
+    print(buy_point)
+    print('selling point:')
+    print(sell_point)
+    
+    return buy_point, sell_point
+
+def get_sp500symbols(number):
+    url = 'https://www.slickcharts.com/sp500'
+    headers = {"User-Agent" : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.116 Safari/537.36'}
+    request = requests.get(url, headers = headers)
+    data = pd.read_html(request.text)[0]
+
+    # 先將代碼中出現'.'取代為'-'，避免yf查不到；之後回傳需要前幾大的股票代碼
+    data['Symbol'] = data['Symbol'].apply(lambda x: x.replace('.', '-'))
+    symbol_lst = data['Symbol'].iloc[:number]
+        
+    return symbol_lst
+
+
+#參數設定
+sma=5 #短線天數
+lma=20 #長線天數
+slot = '3mo'  # 股價區間 slot: 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max
+delta = 5 #查詢指定天數區間內有無出現買賣點
+
+
+# SP500前幾大股票
+sp500_lst = get_sp500symbols(number = 10) #先取得市值前幾大股票代碼
+
+sp_dic = {}
+for stock in sp500_lst:
+    sp_dic['{}'.format(stock)] = crawl_price(stock, sma, lma, slot) 
+    
+sp_Point_result = point(sp_dic, delta) #判斷指定天數內有無買賣點
+
+for p in sp_Point_result: #有買賣點繪圖
+    for stock in p:
+        graph(sp_dic[stock],stock, sma, lma)
