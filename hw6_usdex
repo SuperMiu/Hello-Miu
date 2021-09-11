@@ -34,7 +34,6 @@ SLOT = '5d'  #資料爬取區間
 DAY = 5 #指定天數
 
 if __name__ == '__main__':
-    # SP500前幾大股票
     EXDF = get_usdex(SLOT)
     
     LOW_POINT = usdex_point(EXDF, DAY)
