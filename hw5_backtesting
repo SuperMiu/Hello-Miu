@@ -128,7 +128,7 @@ def MA_backtest(stockdf):
 
 
 #參數設定
-STOCK = 'ARKK'
+STOCK = 'ARKK' #股票yahoo Ticker
 SMA = 5 #短線天數
 LMA = 20 #長線天數
 SLOT = '6mo'  # 股價區間 slot: 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max
