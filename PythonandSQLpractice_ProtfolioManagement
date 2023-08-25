@@ -1,0 +1,303 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Nov 16 05:32:40 2022
+
+@author: clove
+"""
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import sqlite3
+from datetime import datetime, timedelta
+
+def crawl_price(stock, sma = 5, lma = 15, slot='1mo'):
+    # stockid
+    # slot: 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max
+    
+    # crawl price data
+    stockdf = pd.DataFrame(data = yf.Ticker(stock).
+                           history(period = slot))
+    stockdf.reset_index(inplace = True)
+        
+    stockdf['Date'] = pd.to_datetime(stockdf['Date'],
+                                     format = '%Y-%m-%d')                 
+    
+    # 計算SMA及LMA
+    sma_str = 'MA{}'.format(sma)
+    lma_str = 'MA{}'.format(lma)
+    
+    stockdf[sma_str] = stockdf.Close.rolling(window = sma).mean()
+    stockdf[lma_str] = stockdf.Close.rolling(window = lma).mean()
+    
+    stockdf.dropna() # clear the data without MA
+    
+    # 'Signal':當sma大於lma, Signal = 1，否則為0
+    stockdf['Signal'] = np.where(stockdf[sma_str] >= stockdf[lma_str], 1, 0)
+    
+    # 'Point': 判斷Signal變化，當signal[n] 與 signal[n-1](前一交易日)不同:
+    # 1(sma超過lma，買點), -1(sma跌破lma，賣點) , 0(沒變化)
+    stockdf['Point'] = stockdf['Signal'].diff()
+    
+    return stockdf
+
+# --- connect database ---
+dbfile = 'D:/Users/cjliu/Desktop/stock_dashboard/portfolio.db'
+conn = sqlite3.connect(dbfile)
+cur = conn.cursor()
+
+# data_date
+today = (datetime.today() - timedelta(days = 1)) #get previous day data
+if today.weekday() == 5: # if 5 means SAT, then -1 day
+    today = today - timedelta(days = 1)
+elif today.weekday() == 6: # if 6 means SUN, then -2 day
+    today = today - timedelta(days = 2)
+else:
+    pass
+today = today.strftime('%Y-%m-%d')
+
+# grab table positions stock's latest stock price
+stock_dic = {}
+cur.execute('SELECT DISTINCT ticker FROM ticker INNER JOIN positions \
+            ON ticker.id = positions.symbols')
+for row in cur:
+    ticker = row[0]
+    print("get price of stock", ticker)
+    stock_dic[ticker] = crawl_price(ticker)
+    
+# update stock price into DB positions table, and count market value
+for s in stock_dic.items():
+    try:
+        ticker = s[0]
+        price = round(s[1].loc[s[1].index[-1], 'Close'], 2)
+        date = str(s[1].loc[s[1].index[-1], 'Date']).replace(' 00:00:00', '')
+        point = int(s[1].loc[s[1].index[-1], 'Point'])
+        # print(ticker, price)
+        cur.execute('UPDATE positions SET current_price = ?, data_date = ? \
+                    WHERE symbols = (SELECT id FROM ticker WHERE ticker = ? )' \
+                    ,(price, date, ticker))
+        cur.execute('UPDATE positions SET point = ?, data_date = ? \
+                    WHERE symbols = (SELECT id FROM ticker WHERE ticker = ? )' \
+                    ,(point, date, ticker))
+    except:
+        continue
+
+cur.execute('UPDATE positions SET market_value = ROUND(shares * current_price, 2)')
+cur.execute('UPDATE bond SET market_value = ROUND(shares * current_price, 2)')
+
+# insert asset date record to asset table
+cur.execute('INSERT INTO asset (date) VALUES (?)', (today, ) )
+# -sum up each account asset-
+cur.execute('UPDATE asset SET Taiwan_CJ = \
+            (SELECT ROUND(SUM(market_value), 0) FROM positions WHERE account = 1) \
+            WHERE date = ?', (today,) )
+cur.execute('UPDATE asset SET Taiwan_YJ = \
+            (SELECT ROUND(SUM(market_value), 0) FROM positions WHERE account = 3) \
+            WHERE date = ?', (today,) )
+
+cur.execute('UPDATE asset SET TD_CJ = \
+            (SELECT ROUND(SUM(market_value), 0) FROM positions WHERE account = 2) + \
+            (SELECT ROUND(SUM(market_value), 0) FROM bond WHERE account = 2) \
+            WHERE date = ?', (today,) )
+
+cur.execute('UPDATE asset SET TD_YJ = \
+            (SELECT ROUND(SUM(market_value), 0) FROM positions WHERE account = 4) + \
+            (SELECT ROUND(SUM(market_value), 0) FROM bond WHERE account = 4) \
+                WHERE date = ?', (today,) )
+            
+cur.execute('UPDATE asset SET Schwab = \
+            (SELECT ROUND(SUM(market_value), 0) FROM positions WHERE account = 5) + \
+            (SELECT ROUND(SUM(market_value), 0) FROM bond WHERE account = 5) \
+            WHERE date = ?', (today,) )
+            
+cur.execute('UPDATE asset SET Fidelity = \
+            (SELECT ROUND(SUM(market_value), 0) FROM positions WHERE account = 8) \
+            WHERE date = ?', (today,) )
+            
+# -sum up asset by different currency-
+cur.execute('UPDATE asset SET twd_asset = \
+            (SELECT ROUND(SUM(market_value), 0) \
+             FROM positions p INNER JOIN ticker t ON p.symbols = t.id \
+            WHERE t.currency = 1) \
+            WHERE date = ?', (today,) )
+cur.execute('UPDATE asset SET usd_asset = \
+            (SELECT ROUND(SUM(market_value), 0) \
+             FROM positions p INNER JOIN ticker t ON p.symbols = t.id \
+            WHERE t.currency = 2) + \
+            (SELECT ROUND(SUM(market_value), 0) FROM bond)   \
+                WHERE date = ?', (today,) )
+cur.execute('UPDATE asset SET sgd_asset = \
+            (SELECT ROUND(SUM(market_value), 0) \
+             FROM positions p INNER JOIN ticker t ON p.symbols = t.id \
+            WHERE t.currency = 3) \
+            WHERE date = ?', (today,) )
+
+# get exchange rate and count total asset in TWD
+sgdex = yf.Ticker('SGDTWD=X').history(period='1d').iloc[0,3]
+usdex = yf.Ticker('TWD=X').history(period='1d').iloc[0,3]
+us_sg = yf.Ticker('USDSGD=X').history(period='1d').iloc[0,3]
+
+cur.execute('UPDATE asset SET SC_CJ = \
+            (SELECT ROUND(SUM(p.market_value), 0) \
+             FROM positions p INNER JOIN ticker t ON p.symbols = t.id \
+            WHERE p.account = 6 AND t.currency=3) + \
+            (SELECT ROUND(SUM(p.market_value), 0)*?  \
+             FROM positions p INNER JOIN ticker t ON p.symbols = t.id \
+            WHERE p.account = 6 AND t.currency=2) \
+            WHERE date = ?', (us_sg, today))
+          
+cur.execute('UPDATE asset SET SC_YJ = \
+            (SELECT ROUND(SUM(p.market_value), 0) \
+             FROM positions p INNER JOIN ticker t ON p.symbols = t.id \
+             WHERE p.account = 7 AND t.currency=3) + \
+            (SELECT ROUND(SUM(p.market_value), 0)*?  \
+             FROM positions p INNER JOIN ticker t ON p.symbols = t.id \
+            WHERE p.account = 7 AND t.currency=2) \
+            WHERE date = ?', (us_sg, today))
+
+cur.execute('UPDATE asset SET Total_twd = ROUND(twd_asset + sgd_asset * ? + usd_asset * ?, 0) \
+                WHERE date = ?', (sgdex, usdex, today))
+
+#檢查資料缺漏
+cur.execute('SELECT t.ticker FROM positions p INNER JOIN ticker t ON p.symbols = t.id \
+WHERE p.shares!= 0 AND market_value == 0')
+if cur.fetchall() == []:
+    print('all ticker has the price')
+else:
+    print(cur.fetchall(), 'need to refetch price')
+
+conn.commit()
+
+#print all asset results
+
+#1.Total Asset
+cur.execute('SELECT Total_twd FROM asset ORDER BY date DESC LIMIT 1')
+total_asset = int(cur.fetchone()[0])
+cur.execute('SELECT LAG(Total_twd, -1) OVER(ORDER BY date DESC) FROM asset LIMIT 1')
+total_prev = int(cur.fetchone()[0])
+
+total_gain = total_asset - total_prev
+total_percent = round(total_gain / total_prev *100, 2)
+print(f'Total Asset: {total_asset:,} ({total_gain:,}) ; {total_percent}%')
+
+
+
+#2.USD Asset
+cur.execute('SELECT usd_asset FROM asset ORDER BY date DESC')
+usd_asset = int(cur.fetchone()[0])
+cur.execute('SELECT LAG(usd_asset, -1) OVER(ORDER BY date DESC) FROM asset LIMIT 1')
+usd_prev = int(cur.fetchone()[0])
+
+usd_gain = usd_asset - usd_prev
+usd_percent = round(usd_gain / usd_prev *100, 2)
+print(f'USD Asset: {usd_asset:,} ({usd_gain:,}) ; {usd_percent}%')
+
+#3.TWD Asset
+cur.execute('SELECT twd_asset FROM asset ORDER BY date DESC')
+twd_asset = int(cur.fetchone()[0])
+cur.execute('SELECT LAG(twd_asset, -1) OVER(ORDER BY date DESC) FROM asset LIMIT 1')
+twd_prev = int(cur.fetchone()[0])
+
+twd_gain = twd_asset - twd_prev
+twd_percent = round(twd_gain / twd_prev *100, 2)
+print(f'TWD Asset: {twd_asset:,} ({twd_gain:,}) ; {twd_percent}%')
+
+#4.SGD Asset
+cur.execute('SELECT sgd_asset FROM asset ORDER BY date DESC')
+sgd_asset = int(cur.fetchone()[0])
+cur.execute('SELECT LAG(sgd_asset, -1) OVER(ORDER BY date DESC) FROM asset LIMIT 1')
+sgd_prev = int(cur.fetchone()[0])
+
+sgd_gain = sgd_asset - sgd_prev
+sgd_percent = round(sgd_gain / sgd_prev *100, 2)
+print(f'SGD Asset: {sgd_asset:,} ({sgd_gain:,}) ; {sgd_percent}%')
+
+# 5.Schwab
+cur.execute('SELECT Schwab FROM asset ORDER BY date DESC LIMIT 1')
+SCHWAB = int(cur.fetchone()[0])
+cur.execute('SELECT LAG(Schwab, -1) OVER(ORDER BY date DESC) FROM asset LIMIT 1')
+SCHWAB_prev = int(cur.fetchone()[0])
+
+SCHWAB_gain = SCHWAB - SCHWAB_prev
+SCHWAB_percent = round(SCHWAB_gain / SCHWAB_prev *100, 2)
+
+print(f'SCHWAB: {SCHWAB:,} ({SCHWAB_gain:,}) ; {SCHWAB_percent}%')
+
+# 6.TD_CJ
+cur.execute('SELECT TD_CJ FROM asset ORDER BY date DESC LIMIT 1')
+TDCJ = int(cur.fetchone()[0])
+cur.execute('SELECT LAG(TD_CJ, -1) OVER(ORDER BY date DESC) FROM asset LIMIT 1')
+TDCJ_prev = int(cur.fetchone()[0])
+
+TDCJ_gain = TDCJ - TDCJ_prev
+TDCJ_percent = round(TDCJ_gain / TDCJ_prev *100, 2)
+
+print(f'TD_CJ: {TDCJ:,} ({TDCJ_gain:,}) ; {TDCJ_percent}%')
+
+# 7.TD_YJ
+cur.execute('SELECT TD_YJ FROM asset ORDER BY date DESC LIMIT 1')
+TDYJ = int(cur.fetchone()[0])
+cur.execute('SELECT LAG(TD_YJ, -1) OVER(ORDER BY date DESC) FROM asset LIMIT 1')
+TDYJ_prev = int(cur.fetchone()[0])
+
+TDYJ_gain = TDYJ - TDYJ_prev
+TDYJ_percent = round(TDYJ_gain / TDYJ_prev *100, 2)
+
+print(f'TD_Yujen: {TDYJ:,} ({TDYJ_gain:,}) ; {TDYJ_percent}%')
+
+# Ter
+cur.execute('SELECT Fidelity FROM asset ORDER BY date DESC LIMIT 1')
+FD = int(cur.fetchone()[0])
+cur.execute('SELECT LAG(Fidelity, -1) OVER(ORDER BY date DESC) FROM asset LIMIT 1')
+FD_prev = int(cur.fetchone()[0])
+
+FD_gain = FD - FD_prev
+FD_percent = round(FD_gain / FD_prev *100, 2)
+
+print(f'Teradyne: {FD:,} ({FD_gain:,}) ; {FD_percent}%')
+
+# Taiwan_CJ
+cur.execute('SELECT Taiwan_CJ FROM asset ORDER BY date DESC LIMIT 1')
+TWCJ = int(cur.fetchone()[0])
+cur.execute('SELECT LAG(Taiwan_CJ, -1) OVER(ORDER BY date DESC) FROM asset LIMIT 1')
+TWCJ_prev = int(cur.fetchone()[0])
+
+TWCJ_gain = TWCJ - TWCJ_prev
+TWCJ_percent = round(TWCJ_gain / TWCJ_prev *100, 2)
+
+print(f'TW_CJ: {TWCJ:,} ({TWCJ_gain:,}) ; {TWCJ_percent}%')
+
+# Taiwan_YJ
+cur.execute('SELECT Taiwan_YJ FROM asset ORDER BY date DESC LIMIT 1')
+TWYJ = int(cur.fetchone()[0])
+cur.execute('SELECT LAG(Taiwan_YJ, -1) OVER(ORDER BY date DESC) FROM asset LIMIT 1')
+TWYJ_prev = int(cur.fetchone()[0])
+
+TWYJ_gain = TWYJ - TWYJ_prev
+TWYJ_percent = round(TWYJ_gain / TWYJ_prev *100, 2)
+
+print(f'TW_YJ: {TWYJ:,} ({TWYJ_gain:,}) ; {TWYJ_percent}%')
+
+# SC_CJ     
+cur.execute('SELECT SC_CJ FROM asset ORDER BY date DESC LIMIT 1')
+SCCJ = int(cur.fetchone()[0])
+cur.execute('SELECT LAG(SC_CJ, -1) OVER(ORDER BY date DESC) FROM asset LIMIT 1')
+SCCJ_prev = int(cur.fetchone()[0])
+
+SCCJ_gain = SCCJ - SCCJ_prev
+SCCJ_percent = round(SCCJ_gain / SCCJ *100, 2)
+
+print(f'SC_CJ: {SCCJ:,} ({SCCJ_gain:,}) ; {SCCJ_percent}%')
+
+# SC_YJ     
+cur.execute('SELECT SC_YJ FROM asset ORDER BY date DESC LIMIT 1')
+SCYJ = int(cur.fetchone()[0])
+cur.execute('SELECT LAG(SC_YJ, -1) OVER(ORDER BY date DESC) FROM asset LIMIT 1')
+SCYJ_prev = int(cur.fetchone()[0])
+
+SCYJ_gain = SCYJ - SCYJ_prev
+SCYJ_percent = round(SCYJ_gain / SCYJ *100, 2)
+
+print(f'SC_YJ: {SCYJ:,} ({SCYJ_gain:,}) ; {SCYJ_percent}%')
+
+cur.close()
